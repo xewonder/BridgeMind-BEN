@@ -1,6 +1,7 @@
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from nn.timing import ModelTimer
+from nn.tf_guard import tf_lock
 
 class Trick:
 
@@ -19,6 +20,7 @@ class Trick:
         return tricks
 
     def pred_fun(self, x):
-        with ModelTimer.time_call('trick'):
-            result = self._pred_fun_tf(x)
+        with tf_lock:
+            with ModelTimer.time_call('trick'):
+                result = self._pred_fun_tf(x)
         return result

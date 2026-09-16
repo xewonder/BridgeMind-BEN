@@ -75,11 +75,13 @@ except ImportError:
 from flask import Flask, Response, request, jsonify, abort
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
+import ipaddress
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from threading import Lock
 from nn.timing import ModelTimer
+from nn.tf_guard import tf_lock
 
 # Intil fixed in Keras, this is needed to remove a wrong warning
 import warnings
@@ -106,7 +108,7 @@ from claim import Claimer
 dealer_enum = {'N': 0, 'E': 1, 'S': 2, 'W': 3}
 from colorama import Fore, Back, Style, init
 
-version = '0.8.8.6'
+version = '0.8.8.7'
 init()
 
 def handle_exception(e):
@@ -689,21 +691,25 @@ def is_internal_request():
     """Exempt internal requests from rate limiting (localhost and private networks)"""
     from flask import request
     remote_addr = request.remote_addr or ''
-    # Exempt localhost (IPv4 and IPv6)
-    if remote_addr in ('127.0.0.1', '::1', 'localhost'):
+    if remote_addr == 'localhost':
         return True
-    # Exempt private network ranges (RFC 1918)
-    if remote_addr.startswith('192.168.') or \
-       remote_addr.startswith('10.') or \
-       remote_addr.startswith('172.16.') or \
-       remote_addr.startswith('172.17.'):  # Docker default bridge
-        return True
-    return False
+    try:
+        addr = ipaddress.ip_address(remote_addr)
+    except ValueError:
+        return False
+    # is_private covers 10/8, 192.168/16 and all of 172.16/12 - so any Docker
+    # network, not just the default bridge; is_loopback covers 127.0.0.1 and ::1.
+    return addr.is_loopback or addr.is_private
 
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,  # Limits based on the remote IP address
-    default_limits=["20000 per day", "5000 per hour", "100 per minute"]
+    default_limits=["20000 per day", "5000 per hour", "100 per minute"],
+    # Only /play and /bids name the exemption themselves, so without this /bid
+    # and /lead keep counting against the daily cap even on loopback - which a
+    # long robot match reaches. --nolimit switches the limiter off entirely.
+    default_limits_exempt_when=is_internal_request,
+    enabled=not nolimit
     # storage_uri="memory://" # Default, suitable for single-process test server.
                                # For production with multiple workers, use Redis or Memcached:
                                # "redis://localhost:6379"
@@ -1620,7 +1626,8 @@ def autoplay():
         hash_integer = calculate_seed(deal_str)
         print(f"[Autoplay] Setting seed based on deal hash: {hash_integer}")
         np.random.seed(hash_integer)
-        tf.random.set_seed(hash_integer)
+        with tf_lock:
+            tf.random.set_seed(hash_integer)
 
         mp = models.matchpoint      
         if request.args.get("tournament"):

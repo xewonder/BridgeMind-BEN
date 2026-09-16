@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Picks up where BuildAll.cmd stops. Reads the version from _version.py,
-    verifies the four release zips exist and match that version, tags the
+    verifies the release zips exist and match that version, tags the
     commit, then creates the GitHub release and uploads the assets.
 
     Creates a DRAFT by default. Review it on GitHub and hit publish, or pass
@@ -57,7 +57,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$PACKAGES = @('BBA', 'BEN', 'BENAll', 'MvsM')
+$PACKAGES = @('BBA', 'BEN', 'BENAll', 'BENAPI', 'MvsM')
 
 function Fail($message) {
     Write-Host "[publish] ERROR: $message" -ForegroundColor Red
@@ -113,7 +113,7 @@ $version = $version.Trim()
 $tag = "v$version"
 Step "version $version  ->  tag $tag"
 
-# --- the four zips ----------------------------------------------------------
+# --- the release zips -------------------------------------------------------
 $assets = @()
 foreach ($name in $PACKAGES) {
     $zip = Join-Path $PSScriptRoot "$name-$version.zip"

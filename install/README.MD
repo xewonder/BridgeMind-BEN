@@ -44,5 +44,28 @@ repository root, so files that live outside the checkout can be included.
 A release asset may be at most 2 GB; the script refuses anything larger rather
 than failing part-way through an upload.
 
-This is separate from `Publish-Release.ps1`, which uploads the four version
-zips built by `BuildAll.cmd`.
+This is separate from `Publish-Release.ps1`, which uploads the version zips
+built by `BuildAll.cmd`.
+
+## Release packages
+
+`BuildAll.cmd` freezes every spec once into `dist\`, then each `assemble *.cmd`
+only robocopies from `dist\` into its own package folder, which is zipped as
+`<name>-<version>.zip`:
+
+| Package  | Executables                      | Models / configs |
+|----------|----------------------------------|------------------|
+| `BEN`    | `BEN`, `gameserver`, `appserver` | SAYC only (`config\default.conf`) |
+| `BBA`    | `table_manager_client`, `TMCGUI` | the robot systems (BBA/GIB/Lia/...) |
+| `MvsM`   | `table_manager_client`, `TMCGUI` | machine-vs-machine: all 8730 systems |
+| `BENAll` | everything                       | all models, all configs |
+| `BENAPI` | `gameapi` only                   | same selection as `MvsM`, plus `default_api.conf` |
+
+`BENAPI` is the API-only package: just `gameapi.exe` plus the models, configs,
+`BBA\CC` card files, `bin\` native libraries and `nn\` sources it needs. No
+game server, no appserver, no GUI, no table manager client.
+
+It ships the same config and model selection as `MvsM` (the 8730 systems), plus
+`config\default_api.conf` - that is what `gameapi.exe` loads when started
+without `--config`, and none of the `MvsM` patterns match it. Any of the other
+shipped systems can be selected with `--config config\<name>.conf`.

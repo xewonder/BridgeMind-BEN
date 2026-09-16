@@ -2,6 +2,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from nn.timing import ModelTimer
+from nn.tf_guard import tf_lock
 
 class BidInfo:
     
@@ -23,6 +24,7 @@ class BidInfo:
         return self.model(input_tensor, training=False)  # Use model call instead of predict
 
     def pred_fun(self, x):
-        with ModelTimer.time_call('bidinfo'):
-            out_hcp_seq, out_shape_seq = self.pred_fun_tf(x)  # Call the tf.function
-        return out_hcp_seq.numpy(), out_shape_seq.numpy()  # Convert in this function
+        with tf_lock:
+            with ModelTimer.time_call('bidinfo'):
+                out_hcp_seq, out_shape_seq = self.pred_fun_tf(x)  # Call the tf.function
+            return out_hcp_seq.numpy(), out_shape_seq.numpy()  # Convert in this function

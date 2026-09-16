@@ -15,7 +15,7 @@ rem  the PyInstaller 'build\' cache: its Analysis-00.toc lets an unchanged spec
 rem  skip the slow binary-reclassification / dynamic-library scan entirely. Run
 rem  the app from dist\, never from build\, so build\ stays a pure cache.
 echo [BuildAll] clearing previous output folders + dist (keeping build\ cache) ...
-for %%D in (BBA BEN BENAll MvsM dist) do (
+for %%D in (BBA BEN BENAll BENAPI MvsM dist) do (
     if exist "%%D\" rmdir /s /q "%%D"
 )
 
@@ -26,6 +26,7 @@ call :phase "assemble.cmd"
 call :phase "assemble BBA.cmd"
 call :phase "assemble BEN.cmd"
 call :phase "assemble MvsM.cmd"
+call :phase "assemble BENAPI.cmd"
 
 for /f %%S in ('powershell -NoProfile -Command "[datetimeoffset]::UtcNow.ToUnixTimeSeconds()"') do set "_BUILD1=%%S"
 set /a "_BUILDEL=_BUILD1-_BUILD0"
@@ -45,6 +46,8 @@ if errorlevel 1 exit /b 1
 call :zip_folder BEN
 if errorlevel 1 exit /b 1
 call :zip_folder BENAll
+if errorlevel 1 exit /b 1
+call :zip_folder BENAPI
 if errorlevel 1 exit /b 1
 call :zip_folder MvsM
 if errorlevel 1 exit /b 1

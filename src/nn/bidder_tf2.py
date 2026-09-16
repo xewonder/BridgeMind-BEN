@@ -1,6 +1,7 @@
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from nn.timing import ModelTimer
+from nn.tf_guard import tf_lock
 
 class Bidder:
     
@@ -33,7 +34,8 @@ class Bidder:
 
     def pred_fun_seq(self, x):
         # Perform the model prediction (returns tensors)
-        with ModelTimer.time_call('bidder'):
-            bids, alerts = self.pred_fun_tf(x)
-        return bids.numpy(), alerts.numpy()
+        with tf_lock:
+            with ModelTimer.time_call('bidder'):
+                bids, alerts = self.pred_fun_tf(x)
+            return bids.numpy(), alerts.numpy()
 

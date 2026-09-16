@@ -111,6 +111,7 @@ install/BBA/
 install/*.zip
 src/TMCGUI.settings.json
 install/BENAll
+install/BENAPI
 src/log.txt
 scripts/training/contract/jax
 src/suitc.txt

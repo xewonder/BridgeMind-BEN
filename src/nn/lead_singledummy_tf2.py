@@ -2,6 +2,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from nn.timing import ModelTimer
+from nn.tf_guard import tf_lock
 
 class LeadSingleDummy:
 
@@ -19,7 +20,8 @@ class LeadSingleDummy:
 
 
     def pred_fun(self, x):
-        with ModelTimer.time_call('single_dummy'):
-            result = self.pred_fun_tf(x)
-        return result.numpy()
+        with tf_lock:
+            with ModelTimer.time_call('single_dummy'):
+                result = self.pred_fun_tf(x)
+            return result.numpy()
 
