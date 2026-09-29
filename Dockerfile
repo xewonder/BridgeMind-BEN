@@ -51,4 +51,4 @@ RUN ln -s /app /app/src && \
     sed -i 's/\r$//' /app/start_ben_all.sh && chmod +x /app/start_ben_all.sh
 
 EXPOSE 8080 4443 8085
-CMD ./start_ben_all.sh
+CMD ["python3", "gameapi.py", "--host", "0.0.0.0", "--record", "False"]
