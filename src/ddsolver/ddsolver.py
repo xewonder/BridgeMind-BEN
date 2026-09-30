@@ -99,6 +99,141 @@ def _thread_context():
     return ctx
 
 
+# --- Temporary concurrency diagnostic ---------------------------------------
+# Gated entirely by BEN_DDS_CONCURRENCY_PROBE, the same env-var convention as
+# BEN_DDS_RECORD. With it unset, solve_helper takes its original code path and
+# nothing below runs. It answers one question about a live batch: do the
+# solve_board_pbn calls actually overlap in wall-clock time, or do they run
+# back to back? Nothing here can change which card is chosen.
+def _dds_probe_enabled():
+    return os.environ.get("BEN_DDS_CONCURRENCY_PROBE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# threading.get_ident() is monkey-patched by gevent to a per-greenlet number, so
+# it cannot distinguish an OS thread from a greenlet. This reads the kernel
+# thread instead, and records in _OS_TID_KIND which source answered, so a
+# fallback is never mistaken for a real OS identity.
+_OS_TID_KIND = "unprobed"
+
+
+def _os_thread_id():
+    global _OS_TID_KIND
+    try:
+        import ctypes
+        if sys.platform == "win32":
+            _OS_TID_KIND = "GetCurrentThreadId"
+            return int(ctypes.windll.kernel32.GetCurrentThreadId())
+        libc = ctypes.CDLL(None)
+        # gettid() needs glibc >= 2.30 (the image is Ubuntu 24.04). macOS has no
+        # gettid, so the except branch flags the fallback instead of lying.
+        libc.gettid.restype = ctypes.c_int
+        _OS_TID_KIND = "gettid"
+        return int(libc.gettid())
+    except Exception:
+        _OS_TID_KIND = "fallback-python-ident"
+        return threading.get_ident()
+
+
+# CPU seconds charged to the *calling OS thread*. Blocked time does not accrue,
+# so this is what separates "several threads were inside a solve at the same
+# time" from "several threads were waiting at the same time".
+_CPU_CLOCK = getattr(time, "thread_time", None) or time.process_time
+_CPU_CLOCK_NAME = "thread" if getattr(time, "thread_time", None) else "process"
+
+
+def _dds_concurrency_report(dds, events):
+    """Print one stderr line describing real concurrency for one solve batch.
+
+    Reports counts and timings only — never PBN hands, cards, or any input data.
+
+    Two independent signals, because neither one alone is a proof:
+      os_threads / max_simultaneous — are there several kernel threads whose
+        solve intervals overlap in wall-clock time?
+      cores_busy = cpu / wall — how many cores were actually *running* code,
+        from per-thread CPU time, which does not accrue while a thread blocks.
+    spans is the sum of the per-board interval spans. It is reported for shape
+    only and is deliberately NOT turned into a speedup number: if anything
+    blocks inside the call (a lock, a native wait), every waiting thread's span
+    covers that wait, spans pile up, and spans/wall reads as parallelism that is
+    not happening. Verified locally: 16 threads serialised by a lock give
+    max_simultaneous=16 and spans/wall ~15 while cores_busy ~0.9.
+    """
+    tids = {e[0] for e in events}
+    idents = {e[1] for e in events}
+    contexts = {e[2] for e in events}
+
+    # Sweep line over interval boundaries. Ties sort end-before-start because
+    # -1 < 1, so two back-to-back solves are not counted as overlapping.
+    bounds = []
+    for e in events:
+        bounds.append((e[3], 1))
+        bounds.append((e[4], -1))
+    bounds.sort()
+    active = 0
+    peak = 0
+    for _t, delta in bounds:
+        active += delta
+        if active > peak:
+            peak = active
+
+    wall = max(e[4] for e in events) - min(e[3] for e in events)
+    work = sum(e[4] - e[3] for e in events)
+    cpu = sum(e[6] - e[5] for e in events)
+
+    try:
+        from gevent.monkey import is_module_patched
+        patched = str(bool(is_module_patched("threading")))
+    except Exception:
+        patched = "no-gevent"
+
+    pool = getattr(dds, "_pool", None)
+    live = getattr(pool, "_threads", None)
+    sys.stderr.write(
+        "DDS-CONCURRENCY boards=%d configured_max_threads=%s executor_max_workers=%s "
+        "executor_workers_live=%s py_idents=%d os_tid_kind=%s os_threads=%d contexts=%d "
+        "max_simultaneous=%d wall=%.3fs cpu=%.3fs cpu_clock=%s cores_busy=%.2f "
+        "spans=%.3fs verdict=%s "
+        "threading_patched=%s Thread_impl=%s local_impl=%s\n" % (
+            len(events),
+            getattr(dds, "_dds_configured_max_threads", "?"),
+            getattr(pool, "_max_workers", "?"),
+            len(live) if live is not None else "?",
+            len(idents),
+            _OS_TID_KIND,
+            len(tids),
+            len(contexts),
+            peak,
+            wall,
+            cpu,
+            _CPU_CLOCK_NAME,
+            (cpu / wall) if wall > 0 else 0.0,
+            work,
+            _concurrency_verdict(len(tids), peak, cpu, wall),
+            patched,
+            getattr(threading.Thread, "__module__", "?"),
+            getattr(threading.local, "__module__", "?"),
+        ))
+
+
+def _concurrency_verdict(os_threads, max_simultaneous, cpu, wall):
+    """One-word reading of the numbers, so the log cannot be misread later.
+
+    SERIAL           one kernel thread ran the whole batch - the gevent case.
+    SERIAL_INTERVALS several kernel threads exist but no two solve intervals
+                     overlapped: real threads that never ran at once, which is
+                     what a native call that keeps the GIL looks like.
+    BLOCKED          intervals overlap on several threads but barely more than
+                     one core of CPU was burned - they were waiting, not solving.
+    PARALLEL         several kernel threads overlapping AND several cores busy.
+    """
+    busy = (cpu / wall) if wall > 0 else 0.0
+    if os_threads < 2 or max_simultaneous < 2:
+        return "SERIAL" if os_threads < 2 else "SERIAL_INTERVALS"
+    if busy < 1.5:
+        return "BLOCKED"
+    return "PARALLEL"
+
+
 class DDSolver:
 
     # Default for dds_mode changed to 1
@@ -113,6 +248,7 @@ class DDSolver:
         # 0 = one thread per CPU core.
         workers = max_threads if (max_threads and max_threads > 0) else (os.cpu_count() or 4)
         self._workers = workers
+        self._dds_configured_max_threads = max_threads
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dds")
         if verbose:
             sys.stderr.write(f"DDSolver loaded — DDS {self.version()} - dds mode {dds_mode} - {workers} solver threads\n")
@@ -230,11 +366,31 @@ class DDSolver:
                 context=_thread_context(),
             )
 
+        # Diagnostic only (BEN_DDS_CONCURRENCY_PROBE). Unset, task is _solve_one
+        # and this batch behaves exactly as before. Set, every board is timed
+        # inside the worker that runs it, so the report can tell genuine OS
+        # thread overlap apart from greenlets taking turns on one thread. The
+        # probe observes only: it changes no argument, no result and no pool.
+        events = [] if _dds_probe_enabled() else None
+        task = _solve_one
+        if events is not None:
+            def task(pbn):
+                start = time.perf_counter()
+                cpu0 = _CPU_CLOCK()
+                who = (_os_thread_id(), threading.get_ident(), id(_thread_context()))
+                try:
+                    return _solve_one(pbn)
+                finally:
+                    events.append(who + (start, time.perf_counter(), cpu0, _CPU_CLOCK()))
+
         try:
-            solved = list(self._pool.map(_solve_one, hands_pbn))
+            solved = list(self._pool.map(task, hands_pbn))
         except Exception as e:
             print(f"{Fore.RED}DDS error: {e} {hands_pbn[0].encode('utf-8')} {current_trick} {leader_i}{Style.RESET_ALL}")
             return None
+        finally:
+            if events is not None:
+                _dds_concurrency_report(self, events)
 
         if solutions == 1:
             # Just return the maximum number of the side to play for each sample
