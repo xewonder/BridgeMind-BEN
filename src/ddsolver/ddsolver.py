@@ -88,7 +88,59 @@ dds3 = _load_dds3()
 # SolverContext per worker thread; DDSolver parallelises with a thread pool,
 # and solve_board_pbn releases the GIL during the solve, so the threads run
 # concurrently. Each pool thread keeps its own SolverContext.
-_ctx_local = threading.local()
+#
+# Which "thread" that is depends on whether threading has been monkey-patched.
+def _resolve_solver_parallelism():
+    """Pick (executor class, thread-local class) for the DDS worker pool.
+
+    gameapi.py calls monkey.patch_all() before importing this module, and that
+    replaces threading.Thread with a greenlet. concurrent.futures reads
+    threading.Thread at *call* time, so a ThreadPoolExecutor built afterwards
+    starts every "worker" on the single OS thread the gevent hub occupies:
+    max_workers=16, but max_simultaneous=1. solve_board_pbn releases the GIL and
+    never yields to the hub, so a 200-board batch grinds through 200 solves back
+    to back on one core (measured live: os_threads=1, cores_busy=0.98, 33.4 s).
+
+    gevent.threadpool.ThreadPoolExecutor is documented as "a version of
+    concurrent.futures.ThreadPoolExecutor that always uses native threads, even
+    when threading is monkey-patched". Same submit/map/result and exception
+    surface, so the call sites do not change; it wakes the waiting greenlet
+    through the hub's async watcher, so the HTTP server keeps serving while a
+    batch runs. Because those workers really are OS threads, the per-worker
+    SolverContext has to be keyed by OS thread too — threading.local is gevent's
+    greenlet-backed local once patched, and get_original returns the real
+    thread._local.
+
+    An unpatched process (the GUI, the SuitC worker, ddsreplay) already gets
+    genuine OS threads from the stdlib executor, so it keeps both classes it has
+    always used. The two must be decided together: greenlet workers need the
+    greenlet-keyed local, OS-thread workers need the native one.
+    """
+    patched = False
+    try:
+        from gevent.monkey import get_original, is_module_patched
+        patched = bool(is_module_patched("threading"))
+    except Exception:
+        patched = False
+
+    if not patched:
+        return ThreadPoolExecutor, threading.local
+
+    try:
+        from gevent.threadpool import ThreadPoolExecutor as _NativeThreadsExecutor
+    except Exception:
+        # A parallelism fix must never be able to stop the API from starting.
+        return ThreadPoolExecutor, threading.local
+
+    try:
+        native_local = get_original("threading", "local")
+    except Exception:
+        native_local = threading.local
+    return _NativeThreadsExecutor, native_local
+
+
+_SolverPool, _SolverLocal = _resolve_solver_parallelism()
+_ctx_local = _SolverLocal()
 
 
 def _thread_context():
@@ -249,7 +301,7 @@ class DDSolver:
         workers = max_threads if (max_threads and max_threads > 0) else (os.cpu_count() or 4)
         self._workers = workers
         self._dds_configured_max_threads = max_threads
-        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dds")
+        self._pool = _SolverPool(max_workers=workers, thread_name_prefix="dds")
         if verbose:
             sys.stderr.write(f"DDSolver loaded — DDS {self.version()} - dds mode {dds_mode} - {workers} solver threads\n")
         # No-op unless --ddsrecord / BEN_DDS_RECORD asked for a recording. If the
