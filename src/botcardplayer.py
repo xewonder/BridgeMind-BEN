@@ -487,7 +487,9 @@ class CardPlayer:
         if self.verbose:
             print("Samples:", n_samples, " Solving:",len(hands_pbn))
         
+        _split_t0 = time.perf_counter() if self.verbose else 0.0
         dd_solved = self.dds.solve(self.strain_i, leader_i, current_trick52, hands_pbn, 3, purpose="play")
+        _split_solve = (time.perf_counter() - _split_t0) if self.verbose else 0.0
         
         # if defending the target is another
         level = int(self.contract[0])
@@ -559,6 +561,7 @@ class CardPlayer:
 
         if self.verbose:
             print(f'dds took: {(time.time() - t_start):0.4f}')
+            print(f'DDS split: solve={_split_solve:.4f}s post={(time.perf_counter() - _split_t0 - _split_solve):0.4f}s')
         return card_result, (claim_cards, max_value)
     
     
