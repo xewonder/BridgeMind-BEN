@@ -24,6 +24,20 @@ init()
 
 np.set_printoptions(precision=3, suppress=True, linewidth=220, threshold=np.inf)
 
+
+# --- Diagnostic stage timing -------------------------------------------------
+# 'sampling_play' is one ModelTimer bucket covering ~400 lines, and the model
+# timers nested inside it (bidder, bidinfo, leader, player_*) are only part of
+# it, so the bucket alone does not say where the time goes. _stage splits a
+# function into exclusive segments: each label records the time since the
+# previous mark, so the samp_* labels sum to the enclosing bucket instead of
+# adding to it. Labels carry stage names only - never hands, deals or cards.
+def _stage(prev, name):
+    now = time.perf_counter()
+    ModelTimer.record("samp_" + name, (now - prev) * 1000.0)
+    return now
+
+
 def get_small_out_i(small_out):
     x = small_out.copy()
     dec = np.minimum(1, x)
@@ -783,6 +797,7 @@ class Sample:
 
     # shuffle the cards between the 2 hidden hands
     def shuffle_cards_bidding_info(self, n_samples, auction, hand_str, public_hand_str, vuln, known_nesw, h_1_nesw, h_2_nesw, current_trick, hidden_cards, cards_played, shown_out_suits, rng, models):
+        _ts = time.perf_counter()
         hand = binary.parse_hand_f(models.n_cards_bidding)(hand_str)
         if self.verbose:    
             print(f"{Fore.YELLOW}Called shuffle_cards_bidding_info {n_samples} - {rng.bit_generator.state['state']['state']}{Fore.RESET}")
@@ -872,6 +887,7 @@ class Sample:
             r_hcp = np.ones((n_samples, 2))
             r_shp = np.ones((n_samples, 2, 4))
 
+        _ts = _stage(_ts, "gen_prior")
         n_cards_to_receive = np.array([len(hidden_cards) // 2, len(hidden_cards) - len(hidden_cards) // 2], dtype=int)
         h1_h2 = np.zeros((n_samples, 2, models.n_cards_play), dtype=int)
         cards_received = np.zeros((n_samples, 2), dtype=int)
@@ -890,6 +906,7 @@ class Sample:
                         p_shp[other_hand_i, suit] -= shp_reduction_factor
                     cards_shownout_suits.append(card)
 
+        _ts = _stage(_ts, "gen_shownout")
         # With only 10 cards left we don't want to bias hcp and just sample all cards at once
         hidden_cards = [c for c in hidden_cards if c not in cards_shownout_suits]
         if len(hidden_cards) > 10:
@@ -908,6 +925,7 @@ class Sample:
         small_out_i = np.zeros((n_samples, len(small_cards)), dtype=int)
         small_out_i[:, :] = np.array(small_cards)
         small_out_i = np.vectorize(lambda x: rng.permutation(np.copy(x)), signature='(n)->(n)')(small_out_i)
+        _ts = _stage(_ts, "gen_permutations")
 
 
         s_all = np.arange(n_samples)
@@ -945,6 +963,7 @@ class Sample:
             loop += 1
         #print("Loop counter", loop)
 
+        _ts = _stage(_ts, "gen_ak_loop")
         js = np.zeros(n_samples, dtype=int)
         loop = 0
         while True:
@@ -966,6 +985,7 @@ class Sample:
         #print("Loop counter", loop)
         #print(f"{Fore.YELLOW} h1_h2 completed - {rng.bit_generator.state['state']['state']}{Fore.RESET}")
         assert np.sum(h1_h2) == n_samples * np.sum(n_cards_to_receive)
+        _ts = _stage(_ts, "gen_small_loop")
 
         #print("h1_h2", h1_h2[0])
         return h1_h2, use_bidding_info_stats
@@ -1143,6 +1163,7 @@ class Sample:
             )
     
     def init_rollout_states_iterative(self, trick_i, player_i, card_players, played_cards, player_cards_played, shown_out_suits, discards, aceking, current_trick, opening_lead52, auction, hand_str, public_hand_str,vuln, models, rng):
+        _ts = time.perf_counter()
         hand_bidding = binary.parse_hand_f(models.n_cards_bidding)(hand_str)
         n_samples = self.sample_hands_play
         contract = bidding.get_contract(auction)
@@ -1230,6 +1251,7 @@ class Sample:
                     models
                 )
 
+            _ts = _stage(_ts, "generate")
             hidden_hand1, hidden_hand2 = h1_h2[:, 0], h1_h2[:, 1]
             #print("hidden_hand1, hidden_hand2", hidden_hand1, hidden_hand2)
             states = [np.zeros((hidden_hand1.shape[0], 13, 298),dtype=np.int8) for _ in range(4)]
@@ -1269,6 +1291,7 @@ class Sample:
                     states[hidden_1_i][:, k, card] += 1
                 for card in player_cards_played[hidden_2_i][k:]:
                     states[hidden_2_i][:, k, card] += 1
+            _ts = _stage(_ts, "build_states")
         else:
             # In cheat mode all cards are known
             known_nesw = player_to_nesw_i(player_i, contract)
@@ -1306,6 +1329,7 @@ class Sample:
 
         # Use the unique_indices to filter player_states
         states = [state[unique_indices] for state in states]
+        _ts = _stage(_ts, "dedup")
         
         if self.verbose:
             print(f"Unique states {states[0].shape[0]}")
@@ -1321,6 +1345,7 @@ class Sample:
         else:
             c_hcp, c_shp = None, None
         
+        _ts = _stage(_ts, "hcp_shape")
         min_bid_scores = np.ones(states[0].shape[0], dtype=np.float32)
         feature_scores = np.ones(states[0].shape[0], dtype=np.float32)
 
@@ -1330,6 +1355,7 @@ class Sample:
         for h_i in [hidden_1_i, hidden_2_i]:
             feature_scores_h_i =self.validate_features(player_i, aceking, h_i, states[h_i][:, 0, :32], models)
             feature_scores = np.minimum(feature_scores, feature_scores_h_i)
+        _ts = _stage(_ts, "features")
 
         # Loop the samples for each of the 2 hidden hands to check bidding
         # We should generally trust our partners bidding most
@@ -1340,6 +1366,7 @@ class Sample:
             partner = player_i == (h_i + 2) % 4
             bid_scores_h_i = self.get_bid_scores(h_i_nesw, partner, auction, vuln, states[h_i][:, 0, :32], models)
             min_bid_scores = np.minimum(min_bid_scores, bid_scores_h_i)
+        _ts = _stage(_ts, "bid_scores")
 
         # Perhaps this should be calculated more statistical, as we are just taking the bid with the highest score
         # This need to be updated to euclidian distance or logarithmic
@@ -1352,6 +1379,7 @@ class Sample:
         sorted_min_bid_scores = min_bid_scores[sorted_indices]
         # Sort second dimension within each array in states based on min_bid_scores
         bidding_states = np.array(states)[:, sorted_indices]
+        _ts = _stage(_ts, "sort")
 
         #print(bidding_states[0].shape[0])
         valid_bidding_samples_good = np.sum(sorted_min_bid_scores > self.bidding_threshold_sampling)
@@ -1362,6 +1390,7 @@ class Sample:
             mask = sorted_min_bid_scores > self.bid_extend_play_threshold/2
             bidding_states = np.array(bidding_states)[:, mask]
             sorted_min_bid_scores = sorted_min_bid_scores[mask]
+        _ts = _stage(_ts, "bid_mask")
         assert bidding_states[0].shape[0] > 0, "No samples after checking bidding"
 
         if self.verbose:
@@ -1381,6 +1410,7 @@ class Sample:
         else:  
             lead_scores = -np.ones(bidding_states[0].shape[0], dtype=np.float32)
 
+        _ts = _stage(_ts, "lead_validate")
         assert bidding_states[0].shape[0] > 0, "No samples after opening lead"
 
         # no play validation for the last tricks (Right or wrong?)
@@ -1400,6 +1430,7 @@ class Sample:
         if self.verbose:
             print(f"Samples {bidding_states[0].shape[0]} after checking the play. Trick {trick_i + 1}")
 
+        _ts = _stage(_ts, "play_validate")
         assert bidding_states[0].shape[0] > 0, "No samples after checking play"
 
         # Count how many samples we found matching the bidding
@@ -1413,6 +1444,7 @@ class Sample:
             #print("logical_play_scores",logical_play_scores)
         else:
             logical_play_scores = np.ones(bidding_states[0].shape[0], dtype=np.float32)
+        _ts = _stage(_ts, "logical_validate")
 
         if self.check_discard:
             # For the samples we have we will check if any of the discards was unnatural with the actual sample
@@ -1420,6 +1452,7 @@ class Sample:
             #print("discard_scores",discard_scores)
         else:
             discard_scores = np.ones(bidding_states[0].shape[0], dtype=np.float32)
+        _ts = _stage(_ts, "discard_validate")
 
         # With only few cards left we will not filter the samples according to the bidding.
         # We do find only unique, and when starting trick 11 we do not have more than 20 possible combinations
@@ -1539,6 +1572,7 @@ class Sample:
                     discard_scores = discard_scores[valid_mask]
                     sorted_min_bid_scores = sorted_min_bid_scores[valid_mask]
         
+        _ts = _stage(_ts, "select")
         bidding_states = [state[:min(bidding_states[0].shape[0],n_samples)] for state in bidding_states]
         sorted_min_bid_scores = sorted_min_bid_scores[:bidding_states[0].shape[0]]
         lead_scores = lead_scores[:bidding_states[0].shape[0]]
@@ -1552,6 +1586,7 @@ class Sample:
         assert bidding_states[0].shape[0] > 0, "No samples generated for play"
 
         probability_of_occurence = convert_to_probability_with_weight(sorted_min_bid_scores, bidding_states, counts, logical_play_scores, discard_scores, quality)
+        _ts = _stage(_ts, "finalize")
 
         return bidding_states, sorted_min_bid_scores, c_hcp, c_shp, quality, probability_of_occurence, lead_scores, play_scores, logical_play_scores, discard_scores, worlds
 
