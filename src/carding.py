@@ -1,3 +1,4 @@
+import os
 import sys
 from urllib.request import urlopen
 import json
@@ -12,6 +13,15 @@ from colorama import Fore, Back, Style, init
 init()
 
 RANKS = 'AKQJT98765432'
+
+# --- Temporary SuitC A/B switch ----------------------------------------------
+# Gated entirely by BEN_DISABLE_SUITC, the same env-var convention as
+# BEN_GATHER_OPT and BEN_DDS_CONCURRENCY_PROBE. Unset (or 0/false) nothing here
+# runs and SuitC behaves exactly as before. Set to 1, select_right_card_for_play
+# skips the SuitCLib call and returns candidate_cards[0] -- the identical tuple
+# returned when SuitC raises or times out, so only the native wait disappears.
+def _suitc_disabled():
+    return os.environ.get("BEN_DISABLE_SUITC", "").strip().lower() in ("1", "true", "yes", "on")
 
 def cards_equivalent(rank_a, rank_b, opponents_in_suit):
     """Two cards in the same suit play identically when no opponent card ranks
@@ -186,6 +196,9 @@ def select_right_card_for_play(candidate_cards, rng, contract, models, hand_str,
                         if verbose:
                             print("Opponents got more cards in the suit than us, no calculations")
                         return candidate_cards[0].card, who 
+                    if _suitc_disabled():
+                        print("BEN-SUITC disabled_by_env=1")
+                        return candidate_cards[0].card, who
                     from suitc.SuitC import SuitCLib
                     suitc = SuitCLib(verbose)
                     # We just use a simple version of entries
