@@ -1160,7 +1160,12 @@ def play():
 
         # Play
         with model_lock_play:
+            # ModelTimer is a process-wide singleton, so reset and read inside the lock:
+            # a queued /play that reset at the top of its handler would wipe the stats of
+            # the request still running. The summary carries labels and durations only.
+            ModelTimer.reset()  # Reset timing stats for this request
             card_resp, player_i, msg =  play_api(dealer_i, vuln[0], vuln[1], hands, models, sampler, contract, strain_i, decl_i, auction, cards, cardplayer, False, features, effective_verbose)
+            play_timing = ModelTimer.get_summary()
         print("Playing:", card_resp.card.symbol(), msg)
         result = card_resp.to_dict()
         if not details:
@@ -1174,6 +1179,7 @@ def play():
         if record: 
             calculations = {"hand":hand_str, "dummy":dummy_str, "vuln":vuln, "dealer":dealer, "seat":seat, "auction":auction, "play":result}
             logger.info(f"Calculations play: {json.dumps(calculations)}")
+        print(play_timing)
         print(f'Request took {(time.time() - t_start):0.2f} seconds')       
         return json.dumps(result)
     except Exception as e:
