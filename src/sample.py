@@ -2,6 +2,7 @@ import sys
 import time
 import math
 import os
+import hashlib
 import numpy as np
 import tensorflow as tf
 
@@ -36,6 +37,91 @@ def _stage(prev, name):
     now = time.perf_counter()
     ModelTimer.record("samp_" + name, (now - prev) * 1000.0)
     return now
+
+
+def _gather_rows(stack, idx):
+    """Equivalent of ``np.array(stack)[:, idx]`` without the intermediate copy.
+
+    Every sampling filter re-selects rows of the per-seat state tensors with that
+    expression, which first materialises a full-size stack of the whole pool and
+    then gathers it into a second full-size array - two passes over ~77 MB per
+    filter site. Here the destination is allocated once and each seat is gathered
+    straight into it, so the pool is touched once.
+
+    `stack` is either a list of per-seat (N, 13, 298) arrays or an already-stacked
+    (4, N, ...) array - both forms occur at the call sites. `idx` is a boolean mask
+    or an integer index array over the N axis, shared by every seat. The return
+    value has the same type, shape, dtype and row order that
+    ``np.array(stack)[:, idx]`` returns, so nothing downstream can tell the
+    difference. Boolean masks are turned into indices with flatnonzero, which
+    selects the same rows in the same ascending order.
+    """
+    idx = np.asarray(idx)
+    if idx.dtype == np.bool_:
+        idx = np.flatnonzero(idx)
+    out = np.empty((len(stack), idx.shape[0]) + stack[0].shape[1:], dtype=stack[0].dtype)
+    for k, seat in enumerate(stack):
+        np.take(seat, idx, axis=0, out=out[k], mode="raise")
+    return out
+
+
+# --- TEMPORARY A/B diagnostic - remove before any commit ---------------------
+# Lets one deployed container run both gather implementations, chosen by
+# BEN_GATHER_OPT, so the sampling output can be compared in the real runtime
+# without maintaining two source trees. Read once at import: changing the
+# variable therefore needs a process restart. Absent or unset means the
+# ORIGINAL expression, so behaviour is unchanged unless someone asks for it.
+_GATHER_OPT = os.environ.get("BEN_GATHER_OPT", "").strip().lower() in ("1", "true", "yes", "on")
+_SAMPLING_DIGEST = os.environ.get("BEN_SAMPLING_DIGEST", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _gather(stack, idx):
+    """The gather used by every sampling filter, in either mode."""
+    if _GATHER_OPT:
+        return _gather_rows(stack, idx)
+    return np.array(stack)[:, idx]
+
+
+def _canonical_sha256(parts):
+    """Hash (name, shape, dtype, bytes) for each part, in C order.
+
+    np.ascontiguousarray is the point: the original expression returns a
+    non-C-contiguous array and the optimised one a C-contiguous array, so a raw
+    buffer compare would disagree on layout alone. Comparing C-order bytes tests
+    values, which is what has to be identical.
+    """
+    h = hashlib.sha256()
+    for name, obj in parts:
+        if obj is None:
+            h.update(("%s|NONE|" % name).encode())
+            continue
+        if isinstance(obj, (list, tuple)):
+            h.update(("%s|SEQ|%d|" % (name, len(obj))).encode())
+            for item in obj:
+                h.update(str(item).encode("utf-8", "replace"))
+            continue
+        a = np.ascontiguousarray(np.asarray(obj))
+        h.update(("%s|%s|%s|%d|" % (name, a.shape, a.dtype.str, a.nbytes)).encode())
+        h.update(a.tobytes(order="C"))
+    return h.hexdigest()
+
+
+def _sampling_digest(bidding_states, sorted_min_bid_scores, c_hcp, c_shp, quality,
+                     probability_of_occurence, lead_scores, play_scores,
+                     logical_play_scores, discard_scores, worlds):
+    """Digest of everything init_rollout_states_iterative returns."""
+    return _canonical_sha256([
+        ("states0", bidding_states[0]), ("states1", bidding_states[1]),
+        ("states2", bidding_states[2]), ("states3", bidding_states[3]),
+        ("bidding_scores", sorted_min_bid_scores),
+        ("probability_of_occurence", probability_of_occurence),
+        ("lead_scores", lead_scores), ("play_scores", play_scores),
+        ("logical_play_scores", logical_play_scores),
+        ("discard_scores", discard_scores),
+        ("c_hcp", c_hcp), ("c_shp", c_shp),
+        ("quality", np.asarray(quality, dtype=np.float64)),
+        ("worlds", worlds),
+    ]), int(bidding_states[0].shape[0])
 
 
 def get_small_out_i(small_out):
@@ -1340,7 +1426,7 @@ class Sample:
             if np.sum(accept) < n_samples:
                 accept = np.ones_like(accept).astype(bool)
 
-            states = np.array(states)[:, accept]
+            states = _gather(states, accept)
 
         else:
             c_hcp, c_shp = None, None
@@ -1378,7 +1464,7 @@ class Sample:
 
         sorted_min_bid_scores = min_bid_scores[sorted_indices]
         # Sort second dimension within each array in states based on min_bid_scores
-        bidding_states = np.array(states)[:, sorted_indices]
+        bidding_states = _gather(states, sorted_indices)
         _ts = _stage(_ts, "sort")
 
         #print(bidding_states[0].shape[0])
@@ -1388,7 +1474,7 @@ class Sample:
         if bidding_states[0].shape[0] > 2 * self.sample_hands_play and valid_bidding_samples_good > 10:
             # We drop the samples we are not going to use
             mask = sorted_min_bid_scores > self.bid_extend_play_threshold/2
-            bidding_states = np.array(bidding_states)[:, mask]
+            bidding_states = _gather(bidding_states, mask)
             sorted_min_bid_scores = sorted_min_bid_scores[mask]
         _ts = _stage(_ts, "bid_mask")
         assert bidding_states[0].shape[0] > 0, "No samples after checking bidding"
@@ -1463,7 +1549,7 @@ class Sample:
             if valid_bidding_samples >= self.sample_hands_play: 
                 #if self.verbose:
                 valid_mask = sorted_min_bid_scores > self.bidding_threshold_sampling    
-                bidding_states = np.array(bidding_states)[:, valid_mask]
+                bidding_states = _gather(bidding_states, valid_mask)
 
                 lead_scores = lead_scores[valid_mask]
                 play_scores = play_scores[valid_mask]
@@ -1489,7 +1575,7 @@ class Sample:
                     replace=False,                          # No replacement (a permutation)
                     p=combined_probabilities                # Probabilities for weighted randomness
                 )
-                bidding_states = np.array(bidding_states)[:, random_indices]
+                bidding_states = _gather(bidding_states, random_indices)
                 sorted_min_bid_scores = sorted_min_bid_scores[random_indices]
                 lead_scores = lead_scores[random_indices]
                 play_scores = play_scores[random_indices]
@@ -1521,7 +1607,7 @@ class Sample:
                             # Find the first 200 `True` values and set all others to `False`
                             valid_mask[valid_mask.cumsum() > 200] = False
 
-                        bidding_states = np.array(bidding_states)[:, valid_mask]
+                        bidding_states = _gather(bidding_states, valid_mask)
 
                         lead_scores = lead_scores[valid_mask]
                         play_scores = play_scores[valid_mask]
@@ -1587,6 +1673,17 @@ class Sample:
 
         probability_of_occurence = convert_to_probability_with_weight(sorted_min_bid_scores, bidding_states, counts, logical_play_scores, discard_scores, quality)
         _ts = _stage(_ts, "finalize")
+
+        if _SAMPLING_DIGEST:
+            # Placed after the last stage mark so it distorts no samp_* segment;
+            # it does add ~1-2 ms to the enclosing sampling_play in BOTH modes,
+            # so the two arms stay comparable. Hash and row count only - the
+            # sampled deals themselves are never printed.
+            _dg, _rows = _sampling_digest(bidding_states, sorted_min_bid_scores, c_hcp, c_shp, quality,
+                                          probability_of_occurence, lead_scores, play_scores,
+                                          logical_play_scores, discard_scores, worlds)
+            sys.stderr.write("BEN-SAMPLING-DIGEST mode=%s rows=%d sha256=%s\n" % (
+                "optimized" if _GATHER_OPT else "original", _rows, _dg))
 
         return bidding_states, sorted_min_bid_scores, c_hcp, c_shp, quality, probability_of_occurence, lead_scores, play_scores, logical_play_scores, discard_scores, worlds
 
@@ -1702,7 +1799,7 @@ class Sample:
                 # If we did not find 2 samples we ignore the test for opening lead
                 if np.sum(lead_scores_unfiltered >= lead_accept_threshold) > 1:
                     mask = lead_scores_unfiltered > lead_accept_threshold
-                    states = np.array(states)[:, mask]
+                    states = _gather(states, mask)
                     bid_scores = bid_scores[mask]
                     lead_scores = lead_scores_unfiltered[mask]
                 else:
@@ -1834,7 +1931,7 @@ class Sample:
             #print(f"play_accept_threshold {play_accept_threshold:0.3f} reduced")
         
         s_accepted = min_play_scores > play_accept_threshold
-        states = np.array(states)[:, s_accepted]
+        states = _gather(states, s_accepted)
         lead_scores = lead_scores[s_accepted]
         bidding_scores = bidding_scores[s_accepted]
         min_play_scores = min_play_scores[s_accepted]
